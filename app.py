@@ -130,7 +130,21 @@ def resolve_db_path() -> Path:
     for path in DB_CANDIDATES:
         if path.exists():
             return path
-    return DB_CANDIDATES[0]
+
+    # 클라우드 배포 시 앱 소스 체크아웃 디렉터리가 읽기 전용일 수 있음(예:
+    # Streamlit Community Cloud의 /mount/src/...) — 새 DB를 만들기 전에 쓰기
+    # 가능 여부를 확인하고, 안 되면 임시 디렉터리로 폴백한다.
+    candidate = DB_CANDIDATES[0]
+    try:
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        probe = candidate.parent / ".write_test"
+        probe.touch()
+        probe.unlink()
+        return candidate
+    except OSError:
+        import tempfile
+
+        return Path(tempfile.gettempdir()) / "ecommerce.db"
 
 
 @st.cache_resource
