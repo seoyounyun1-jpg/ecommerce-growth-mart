@@ -206,36 +206,60 @@ def compute_funnel_metrics(df: pd.DataFrame) -> dict[str, float]:
     }
 
 
-def find_bottleneck(metrics: dict[str, float]) -> tuple[str, str, float]:
-    """가장 큰 이탈률 구간과 인사이트 문구 반환."""
+def build_stage_detail_table(metrics: dict[str, float]) -> pd.DataFrame:
+    """GA4 퍼널 탐색 형식의 단계별 상세 테이블(인원수 · 전체대비 · 이전단계대비 · 이탈률)."""
     stages = [(label, metrics[key]) for key, label in FUNNEL_STAGES]
-    max_drop_rate = 0.0
-    bottleneck_from = ""
-    bottleneck_to = ""
+    total = stages[0][1] if stages else 0
 
-    for i in range(len(stages) - 1):
-        from_label, from_val = stages[i]
-        to_label, to_val = stages[i + 1]
-        if from_val <= 0:
-            continue
-        drop_rate = (from_val - to_val) / from_val
-        if drop_rate > max_drop_rate:
-            max_drop_rate = drop_rate
-            bottleneck_from = from_label
-            bottleneck_to = to_label
+    rows = []
+    prev_val = None
+    for label, val in stages:
+        pct_of_total = (val / total * 100) if total > 0 else 0.0
+        if prev_val is None:
+            pct_of_prev = 100.0
+            drop_rate = 0.0
+        else:
+            pct_of_prev = (val / prev_val * 100) if prev_val > 0 else 0.0
+            drop_rate = 100.0 - pct_of_prev
+        rows.append(
+            {
+                "단계": label,
+                "인원수": int(val),
+                "전체 대비 비율": pct_of_total,
+                "이전 단계 대비 유지율": pct_of_prev,
+                "이탈률": drop_rate,
+            }
+        )
+        prev_val = val
 
-    if max_drop_rate == 0:
-        return "—", "데이터가 부족하여 병목 구간을 산출할 수 없습니다.", 0.0
+    return pd.DataFrame(rows)
 
-    insight = (
-        f"**병목 구간: {bottleneck_from} → {bottleneck_to}**\n\n"
-        f"이 구간에서 **{max_drop_rate:.1%}** 의 사용자가 이탈했습니다.\n\n"
-        "**그로스 액션 제안**\n"
-        f"- `{bottleneck_from}` 직후 리타겟팅 광고(리마케팅) 집행\n"
-        f"- `{bottleneck_to}` 진입 UX 개선 A/B 테스트 (CTA·배송비·결제수단)\n"
-        "- UTM 소스별 전환율 비교 후 저성과 채널 예산 재배분"
+
+def build_funnel_trend(filtered: pd.DataFrame) -> pd.DataFrame:
+    """일자별 단계 합계 + 종합 CVR 추이."""
+    stage_cols = [col for col, _ in FUNNEL_STAGES]
+    daily = filtered.groupby("base_date")[stage_cols].sum().reset_index()
+    daily = daily.sort_values("base_date")
+    daily["cvr"] = daily.apply(
+        lambda r: (r["purchase_completed_count"] / r["total_visitors"] * 100)
+        if r["total_visitors"] > 0
+        else 0.0,
+        axis=1,
     )
-    return f"{bottleneck_from} → {bottleneck_to}", insight, max_drop_rate
+    return daily
+
+
+def build_segment_breakdown(filtered: pd.DataFrame, dimension: str) -> pd.DataFrame:
+    """선택한 측정기준(플랫폼/UTM Source)별 최종 CVR 비교."""
+    stage_cols = [col for col, _ in FUNNEL_STAGES]
+    grouped = filtered.groupby(dimension)[stage_cols].sum().reset_index()
+    grouped["cvr"] = grouped.apply(
+        lambda r: (r["purchase_completed_count"] / r["total_visitors"] * 100)
+        if r["total_visitors"] > 0
+        else 0.0,
+        axis=1,
+    )
+    return grouped.sort_values("cvr", ascending=False)
 
 
 def render_pipeline_tab(db_path: str) -> None:
@@ -260,6 +284,62 @@ def render_pipeline_tab(db_path: str) -> None:
             st.caption(title)
             st.code(detail, language=None)
 
+    with st.expander("📖 데이터 출처 & 집계 기준 열람", expanded=False):
+        src_tab, criteria_tab, rfm_tab = st.tabs(
+            ["데이터 출처 · 수집 방식", "퍼널 지표 정의", "RFM 세그먼트 기준"]
+        )
+
+        with src_tab:
+            st.markdown(
+                """
+                | 구분 | 내용 |
+                |---|---|
+                | **소스 시스템** | NAVER Commerce API · Amazon SP-API (현재는 Mock 응답 — 실 운영 시 API Key 기반 실호출로 교체) |
+                | **수집 단위** | 주문(Order) JSON + 사용자 행동 로그(behavior log) JSON, 일자별 배치 |
+                | **원본 보존** | RAW Zone에 표준화 이전 원본 JSON 그대로 적재 (재처리·검증용) |
+                | **환율 처리** | Amazon(USD) 주문은 수집 시점 환율로 KRW 환산 후 표준화 |
+                | **시간대 처리** | Amazon 응답은 UTC(Z suffix) → KST(+9h)로 변환 후 저장 |
+                """
+            )
+
+        with criteria_tab:
+            st.markdown(
+                """
+                | 구분 | 내용 |
+                |---|---|
+                | **주문 Lookback** | 14일 — 최근 14일 주문을 매일 재수집해 취소·환불 상태 변경을 반영 |
+                | **행동 로그 Lookback** | 없음(0일) — 로그는 발생 후 불변이라 당일 수집분만 적재 |
+                | **Mart 재계산 범위** | `mart_user_funnel_daily`는 [run_date − 14일, run_date] 구간만 삭제 후 재계산(증분), 구간 밖 과거 데이터는 보존 |
+                | **RFM 재계산 범위** | 매번 전체 재적재 — Recency가 신규 주문 여부와 무관하게 매일 전체 유저 기준으로 변하기 때문 |
+                | **방문(total_visitors)** | 세션 단위 고유 방문자 수 |
+                | **상품 조회** | `view_item` 이벤트 발생 건 |
+                | **장바구니** | `add_to_cart` 이벤트 발생 건 |
+                | **결제 시작** | `begin_checkout` 이벤트 발생 건 |
+                | **구매 완료** | `purchase` 이벤트 발생 건 (결제 완료 주문과 매칭) |
+                """
+            )
+
+        with rfm_tab:
+            st.markdown(
+                """
+                RFM 3요소를 각각 5분위(NTILE 5)로 점수화한 뒤 아래 규칙으로 세그먼트를 분류합니다.
+
+                | 세그먼트 | 조건 |
+                |---|---|
+                | **VIP** | R≥4 AND F≥4 AND M≥4 |
+                | **이탈위기** | R≤2 AND (F≥3 OR M≥3) — 과거 우수 고객의 최근 이탈 징후 |
+                | **신규** | F=1 AND R≥4 — 최근 첫 구매 고객 |
+                | **겨울잠** | R≤2 AND F≤2 AND M≤2 — 장기 비활성 저가치 |
+                | 그 외 | F·M 가중치로 VIP/이탈위기/겨울잠 중 가장 가까운 세그먼트에 매핑 |
+
+                - **R (Recency)**: 마지막 구매일로부터 경과일 — 최근일수록 높은 점수
+                - **F (Frequency)**: 누적 구매 건수(고유 주문 수)
+                - **M (Monetary)**: 누적 결제 금액 합계
+                """
+            )
+
+        st.caption("기준 원본: `sql/03_etl_staging_to_mart.sql`, `stages/clean_transform.py`, `stages/api_client.py`")
+
     try:
         stats = load_pipeline_stats(db_path)
     except Exception as exc:
@@ -278,6 +358,7 @@ def render_pipeline_tab(db_path: str) -> None:
         st.warning("⚠️ 일부 Zone에 데이터가 없습니다. `python pipeline.py`를 실행해 주세요.")
 
     st.markdown("##### Zone별 Row Count")
+    st.caption("RAW→Staging→Mart 각 단계가 정상 통과됐는지 확인하는 파이프라인 헬스체크입니다. (분석 지표 아님 — 0이면 해당 단계 실패를 의심)")
     z1, z2, z3 = st.columns(3)
     with z1:
         st.metric("RAW — 주문 JSON", f"{stats.get('raw_ecommerce_orders', 0):,}")
@@ -355,76 +436,141 @@ def render_funnel_tab(db_path: str) -> None:
             & (filtered["base_date"].dt.date <= end)
         ]
 
+    if filtered.empty:
+        st.info("선택한 필터 조건에 해당하는 데이터가 없습니다.")
+        return
+
     metrics = compute_funnel_metrics(filtered)
     stage_labels = [label for _, label in FUNNEL_STAGES]
     stage_values = [metrics[key] for key, _ in FUNNEL_STAGES]
 
-    chart_col, insight_col = st.columns([2, 1])
+    # --- A. 상단 요약 지표 -------------------------------------------------
+    total_visitors = filtered["total_visitors"].sum()
+    total_purchases = filtered["purchase_completed_count"].sum()
+    overall_cvr = (total_purchases / total_visitors * 100) if total_visitors > 0 else 0.0
 
-    with chart_col:
-        chart_type = st.radio(
-            "차트 유형",
-            ["Funnel", "Bar"],
-            horizontal=True,
-            label_visibility="collapsed",
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    kpi1.metric("총 진입수", f"{int(total_visitors):,}")
+    kpi2.metric("최종 전환수", f"{int(total_purchases):,}")
+    kpi3.metric("종합 CVR", f"{overall_cvr:.2f}%")
+    kpi4.metric("집계 일수 · 행수", f"{filtered['base_date'].nunique()}일 · {len(filtered):,}건")
+
+    st.divider()
+
+    # --- B. 퍼널 시각화 -----------------------------------------------------
+    chart_type = st.radio(
+        "차트 유형",
+        ["Funnel", "Bar"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    if chart_type == "Funnel":
+        fig = go.Figure(
+            go.Funnel(
+                y=stage_labels,
+                x=stage_values,
+                textinfo="value+percent initial+percent previous",
+                marker={"color": px.colors.sequential.Blues_r},
+            )
         )
-
-        if chart_type == "Funnel":
-            fig = go.Figure(
-                go.Funnel(
-                    y=stage_labels,
-                    x=stage_values,
-                    textinfo="value+percent initial",
-                    marker={"color": px.colors.sequential.Blues_r},
-                )
-            )
-            fig.update_layout(
-                title="전환 퍼널",
-                height=480,
-                margin=dict(l=20, r=20, t=50, b=20),
-            )
-        else:
-            fig = px.bar(
-                x=stage_labels,
-                y=stage_values,
-                labels={"x": "단계", "y": "건수"},
-                title="퍼널 단계별 건수 (Bar)",
-                color=stage_values,
-                color_continuous_scale="Blues",
-            )
-            fig.update_layout(height=480, showlegend=False)
-
-        st.plotly_chart(fig)
-
-        if filtered.empty:
-            st.info("선택한 필터 조건에 해당하는 데이터가 없습니다.")
-        else:
-            st.dataframe(
-                filtered.sort_values("base_date", ascending=False),
-                width="stretch",
-                hide_index=True,
-            )
-
-    with insight_col:
-        st.markdown("#### 📋 그로스 인사이트")
-        bottleneck_stage, insight_text, drop_rate = find_bottleneck(metrics)
-
-        if drop_rate > 0:
-            st.metric("최대 이탈 구간", bottleneck_stage)
-            st.metric("구간 이탈률", f"{drop_rate:.1%}")
-
-        st.warning(insight_text)
-
-        avg_cvr = (
-            filtered["purchase_completed_count"].sum()
-            / filtered["total_visitors"].sum()
-            if filtered["total_visitors"].sum() > 0
-            else 0
+        fig.update_layout(
+            title="전환 퍼널 (전체 대비 % · 이전 단계 대비 %)",
+            height=460,
+            margin=dict(l=20, r=20, t=50, b=20),
         )
-        st.info(
-            f"**필터 적용 최종 CVR**: {avg_cvr:.2%}\n\n"
-            f"집계 기간: {len(filtered['base_date'].unique())}일 · "
-            f"행 {len(filtered):,}건"
+    else:
+        fig = px.bar(
+            x=stage_labels,
+            y=stage_values,
+            labels={"x": "단계", "y": "건수"},
+            title="퍼널 단계별 건수 (Bar)",
+            color=stage_values,
+            color_continuous_scale="Blues",
+        )
+        fig.update_layout(height=460, showlegend=False)
+
+    st.plotly_chart(fig)
+
+    # --- C. 단계별 전환율 상세 테이블 --------------------------------------
+    st.markdown("#### 📊 단계별 전환율 상세")
+    detail_df = build_stage_detail_table(metrics)
+    max_drop_idx = detail_df["이탈률"].idxmax() if len(detail_df) > 1 else None
+
+    display_df = detail_df.copy()
+    display_df["전체 대비 비율"] = display_df["전체 대비 비율"].map("{:.1f}%".format)
+    display_df["이전 단계 대비 유지율"] = display_df["이전 단계 대비 유지율"].map("{:.1f}%".format)
+    display_df["이탈률"] = display_df["이탈률"].map("{:.1f}%".format)
+    display_df["인원수"] = display_df["인원수"].map("{:,}".format)
+
+    def _highlight_max_drop(row):
+        if max_drop_idx is not None and row.name == max_drop_idx and row.name != 0:
+            return ["background-color: rgba(220,38,38,0.08)"] * len(row)
+        return [""] * len(row)
+
+    st.dataframe(
+        display_df.style.apply(_highlight_max_drop, axis=1),
+        width="stretch",
+        hide_index=True,
+    )
+
+    st.divider()
+
+    # --- D. 퍼널 추이 (트렌드) ------------------------------------------
+    st.markdown("#### 📈 퍼널 추이")
+    trend_metric = st.selectbox(
+        "지표 선택",
+        ["종합 CVR"] + stage_labels,
+    )
+    trend_df = build_funnel_trend(filtered)
+
+    if trend_metric == "종합 CVR":
+        trend_fig = px.line(
+            trend_df, x="base_date", y="cvr",
+            labels={"base_date": "일자", "cvr": "CVR (%)"},
+            title="일자별 종합 CVR 추이",
+            markers=True,
+        )
+    else:
+        key_by_label = {label: key for key, label in FUNNEL_STAGES}
+        col = key_by_label[trend_metric]
+        trend_fig = px.line(
+            trend_df, x="base_date", y=col,
+            labels={"base_date": "일자", col: "인원수"},
+            title=f"일자별 '{trend_metric}' 인원수 추이",
+            markers=True,
+        )
+    trend_fig.update_layout(height=360)
+    st.plotly_chart(trend_fig)
+
+    st.divider()
+
+    # --- E. 세그먼트 비교 (Breakdown) --------------------------------------
+    st.markdown("#### 🔍 세그먼트 비교")
+    breakdown_dim = st.radio(
+        "비교 기준",
+        ["platform", "utm_source"],
+        format_func=lambda x: "플랫폼" if x == "platform" else "UTM Source",
+        horizontal=True,
+    )
+    breakdown_df = build_segment_breakdown(filtered, breakdown_dim)
+    breakdown_fig = px.bar(
+        breakdown_df,
+        x=breakdown_dim,
+        y="cvr",
+        labels={breakdown_dim: "플랫폼" if breakdown_dim == "platform" else "UTM Source", "cvr": "최종 CVR (%)"},
+        title="세그먼트별 최종 CVR 비교",
+        color="cvr",
+        color_continuous_scale="Blues",
+    )
+    breakdown_fig.update_layout(height=360, showlegend=False)
+    st.plotly_chart(breakdown_fig)
+
+    with st.expander("원본 데이터 보기"):
+        st.dataframe(
+            filtered.sort_values("base_date", ascending=False),
+            width="stretch",
+            hide_index=True,
         )
 
 
